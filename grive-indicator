@@ -1,0 +1,348 @@
+#!/usr/bin/env python3
+
+import time
+import asyncio
+from asyncio.subprocess import PIPE, STDOUT
+from pathlib import PurePath, Path
+from itertools import cycle
+import webbrowser
+import sys
+import gbulb
+import gi
+gi.require_version('AppIndicator3', '0.1')
+gi.require_version('Notify', '0.7')
+gi.require_version('Gtk', '3.0')
+from gi.repository import GLib, Gtk, Gio, AppIndicator3, Notify
+try:
+	from grive_utils.common import *
+	from grive_utils.dialog import *
+except ImportError:
+	from package.common import *
+	from package.dialog import *
+
+
+class Indicator(object):
+
+	def __init__(self):
+
+		if not CONFIG.getboolean('DEFAULT', 'init'):
+			dialog = Fatal(
+				None,
+				'grive-indicator is not configured',
+				'Run grive-setup first to choose folder to sync')
+			dialog.run()
+			dialog.destroy()
+			sys.exit(1)
+
+		self.loop = asyncio.get_event_loop()
+		if CONFIG.getboolean('DEFAULT', 'Pause'):
+			self.set_active_icon(False)
+		else:
+			self.set_active_icon(True)
+		self.set_error_icon()
+		self.set_worker_icons()
+		self.indicator = AppIndicator3.Indicator.new(
+			'grive-utils-indicator',
+			self.icon,
+			AppIndicator3.IndicatorCategory.APPLICATION_STATUS)
+		self.indicator.set_attention_icon(self.error_icon)
+		self.indicator.set_menu(self.build_menu())
+		self.indicator.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
+		self.notification_start = Notify.Notification.new(
+			'Synchronizing...', None, 'grive-utils')
+		self.notification_finish = Notify.Notification.new(
+			'Finished!', None, 'grive-utils')
+
+		self.griveignore = Path(CONFIG['DEFAULT']['Path']) / '.griveignore'
+		self.load_ignores()
+		self.queue = []
+		self.synchronizing = False
+		asyncio.ensure_future(self.runner())
+		asyncio.ensure_future(self.scheduler())
+		self.monitors = {}
+		self.watch()
+
+		self.loop.run_forever()
+
+	def load_ignores(self):
+
+		self.ignored = []
+		if self.griveignore.exists():
+			with self.griveignore.open() as fd:
+				globs = fd.read().split('\n')
+			self.ignored = [glob for glob in globs if glob]
+		self.ignored += ['.grive', '.grive_state']
+
+	def set_active_icon(self, state):
+
+		if CONFIG.getboolean('DEFAULT', 'LightPanel'):
+			if state:
+				self.icon = 'grive-utils-active-light'
+			else:
+				self.icon = 'grive-utils-inactive-light'
+		else:
+			if state:
+				self.icon = 'grive-utils-active'
+			else:
+				self.icon = 'grive-utils-inactive'
+
+	def set_error_icon(self):
+
+		if CONFIG.getboolean('DEFAULT', 'LightPanel'):
+			self.error_icon = 'grive-utils-error-light'
+		else:
+			self.error_icon = 'grive-utils-error'
+
+	def set_worker_icons(self):
+
+		if CONFIG.getboolean('DEFAULT', 'LightPanel'):
+			self.worker_icons = (
+				'grive-utils-working-1-light', 'grive-utils-working-2-light',
+				'grive-utils-working-3-light')
+		else:
+			self.worker_icons = (
+				'grive-utils-working-1', 'grive-utils-working-2',
+				'grive-utils-working-3')
+
+	def build_menu(self):
+
+		menu = Gtk.Menu()
+		self.menu_sync = Gtk.MenuItem.new_with_label('Sync now')
+		self.menu_sync.connect('activate', self.sync_cancel)
+		menu.append(self.menu_sync)
+		self.paused = Gtk.CheckMenuItem.new_with_label('Pause sync')
+		self.paused.set_active(CONFIG.getboolean('DEFAULT', 'Pause'))
+		self.paused.connect('toggled', self.pause)
+		menu.append(self.paused)
+		sep1 = Gtk.SeparatorMenuItem()
+		menu.append(sep1)
+		open_folder = Gtk.MenuItem.new_with_label('Open grive folder')
+		open_folder.connect('activate', self.open_folder)
+		menu.append(open_folder)
+		open_drive = Gtk.MenuItem.new_with_label('Open Google Drive')
+		open_drive.connect('activate', self.open_drive)
+		menu.append(open_drive)
+		sep2 = Gtk.SeparatorMenuItem()
+		menu.append(sep2)
+		configure = Gtk.MenuItem.new_with_label('Preferences')
+		configure.connect('activate', self.configure)
+		menu.append(configure)
+		select_sync = Gtk.MenuItem.new_with_label('Select files to sync')
+		select_sync.connect('activate', self.select_sync)
+		menu.append(select_sync)
+		quit = Gtk.MenuItem.new_with_label('Quit')
+		quit.connect('activate', self.quit)
+		menu.append(quit)
+		menu.show_all()
+		return menu
+
+	def quit(self, menu_item):
+
+		self.loop.stop()
+
+	def sync_cancel(self, menu_item):
+
+		if CONFIG.getboolean('DEFAULT', 'Pause'):
+			self.paused.set_active(False)
+		if not self.synchronizing:
+			self.queue.append(time.monotonic() - 1)
+		else:
+			self.grive.terminate()
+			self.menu_sync.set_label('Sync now')
+			self.synchronizing = False
+
+	def pause(self, menu_item):
+
+		if menu_item.get_active():
+			CONFIG['DEFAULT']['Pause'] = 'true'
+			self.set_active_icon(False)
+			self.indicator.set_icon(self.icon)
+		else:
+			CONFIG['DEFAULT']['Pause'] = 'false'
+			self.set_active_icon(True)
+			self.indicator.set_icon(self.icon)
+			self.queue.append(time.monotonic())
+		save_config()
+
+	def open_folder(self, menu_item):
+
+		asyncio.ensure_future(self.open_folder_async())
+
+	async def open_folder_async(self):
+
+		await asyncio.create_subprocess_exec(
+			'xdg-open', CONFIG['DEFAULT']['Path'])
+
+	def open_drive(self, menu_item):
+
+		webbrowser.open('https://drive.google.com/drive/my-drive')
+
+	def configure(self, menu_item):
+
+		dialog = Prefs(None)
+		response = dialog.run()
+		if response == Gtk.ResponseType.OK:
+			if CONFIG.getboolean('DEFAULT', 'Pause'):
+				self.set_active_icon(False)
+			else:
+				self.set_active_icon(True)
+			self.set_error_icon()
+			self.set_worker_icons()
+			self.indicator.set_icon(self.icon)
+			self.indicator.set_attention_icon(self.error_icon)
+		dialog.destroy()
+
+	def select_sync(self, menu_item):
+
+		asyncio.ensure_future(self.select_sync_async())
+
+	async def select_sync_async(self):
+
+		await asyncio.create_subprocess_exec('./griveignore-editor')
+
+	def watch(self):
+
+		def subdirectories(root):
+
+			enum = root.enumerate_children(
+				'standard::name,standard::type',
+				Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS,
+				None)
+			success, info, gfile = enum.iterate(None)
+			while info and gfile:
+				file_type = info.get_attribute_uint32('standard::type')
+				if file_type == Gio.FileType.DIRECTORY:
+					yield (gfile.get_path(), gfile.monitor_directory(0, None))
+					yield from subdirectories(gfile)
+				success, info, gfile = enum.iterate(None)
+
+		root_path = CONFIG['DEFAULT']['Path']
+		root = Gio.File.new_for_path(root_path)
+		self.monitors[root_path] = root.monitor_directory(0, None)
+		for path, monitor in subdirectories(root):
+			self.monitors[path] = monitor
+		for path, monitor in self.monitors.items():
+			monitor.connect('changed', self.on_event)
+
+	def on_event(self, monitor, gfile, other_gfile, event_type):
+
+		if event_type == Gio.FileMonitorEvent.CHANGES_DONE_HINT:
+			path = gfile.get_path()
+			if path == str(self.griveignore):
+				self.load_ignores()
+			if not self.glob(path):
+				self.queue.append(time.monotonic())
+				#~ print('Changed:', gfile.get_path())
+		elif event_type == Gio.FileMonitorEvent.CREATED:
+			file_type = gfile.query_file_type(
+				Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS, None)
+			path = gfile.get_path()
+			if file_type == Gio.FileType.DIRECTORY:
+				monitor = gfile.monitor_directory(0, None)
+				monitor.connect('changed', self.on_event)
+				self.monitors[path] = monitor
+			#~ print('Created:', path)
+		elif event_type == Gio.FileMonitorEvent.DELETED:
+			path = gfile.get_path()
+			if path in self.monitors:
+				self.monitors[path].cancel()
+				del self.monitors[path]
+			if path == str(self.griveignore):
+				self.load_ignores()
+			if not self.glob(path):
+				self.queue.append(time.monotonic())
+				#~ print('Deleted:', path)
+
+	def glob(self, path):
+
+		matches = []
+		path = PurePath(path)
+		for glob in self.ignored:
+			matches.append(path.match(glob))
+		return any(matches)
+
+	async def runner(self):
+
+		if not CONFIG.getboolean('DEFAULT', 'Pause'):
+			await self.sync()
+		while True:
+			if not CONFIG.getboolean('DEFAULT', 'Pause'):
+				if self.queue:
+					now = time.monotonic()
+					if (now - self.queue[-1]) >= 1:
+						self.queue.clear()
+						await self.sync()
+			await asyncio.sleep(1)
+
+	async def scheduler(self):
+
+		while True:
+			interval = int(CONFIG['DEFAULT']['Interval'])
+			timestamp = time.monotonic()
+			if interval:
+				while True:
+					now = time.monotonic()
+					if (now - timestamp) >= (interval * 60):
+						self.queue.append(now)
+						break
+					await asyncio.sleep(15)
+			await asyncio.sleep(1)
+
+	async def sync(self):
+
+		args = ['grive', '--path', CONFIG['DEFAULT']['Path']]
+		if int(CONFIG['DEFAULT']['UpRate']):
+			args.extend(['--upload-speed', CONFIG['DEFAULT']['UpRate']])
+		if int(CONFIG['DEFAULT']['DownRate']):
+			args.extend(['--download-speed', CONFIG['DEFAULT']['DownRate']])
+		self.grive = await asyncio.create_subprocess_exec(
+			*args, stdout=PIPE, stderr=STDOUT)
+		animated = False
+		while True:
+			line = (await self.grive.stdout.readline()).decode()
+			if line.startswith('sync '):
+				self.menu_sync.set_label('Cancel')
+				if CONFIG.getboolean('DEFAULT', 'Notify'):
+					path = FILENAME.match(line).group('local')
+					self.notification_start.update(
+						'Synchronizing...', path, 'grive-utils')
+					self.notification_start.show()
+				if not animated:
+					self.synchronizing = True
+					asyncio.ensure_future(self.animate())
+					animated = True
+			elif line.startswith('Finished!'):
+				self.menu_sync.set_label('Sync now')
+				self.synchronizing = False
+			elif self.grive.stdout.at_eof():
+				break
+			await asyncio.sleep(3)
+			self.notification_start.close()
+		exit_code = await self.grive.wait()
+		if exit_code and exit_code != -15:
+			self.indicator.set_status(AppIndicator3.IndicatorStatus.ATTENTION)
+		else:
+			self.indicator.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
+			if CONFIG.getboolean('DEFAULT', 'Notify') and animated:
+				asyncio.ensure_future(self.notify_finish())
+
+	async def animate(self):
+
+		iter_icons = cycle(self.worker_icons)
+		while self.synchronizing:
+			self.indicator.set_icon(next(iter_icons))
+			await asyncio.sleep(0.5)
+		self.indicator.set_icon(self.icon)
+
+	async def notify_finish(self):
+
+		self.notification_finish.show()
+		await asyncio.sleep(5)
+		self.notification_finish.close()
+
+
+if __name__ == '__main__':
+	gbulb.install()
+	Notify.init('grive-utils')
+	Indicator()
+	Notify.uninit()

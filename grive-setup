@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+
+import asyncio
+from asyncio.subprocess import PIPE, STDOUT
+import webbrowser
+import sys
+import gbulb
+import gi
+gi.require_version('Gtk', '3.0')
+from gi.repository import Gtk
+try:
+	from grive_utils.common import *
+	from grive_utils.dialog import *
+except ImportError:
+	from package.common import *
+	from package.dialog import *
+
+
+class Setup(Gtk.Window):
+
+	def __init__(self):
+
+		Gtk.Window.__init__(self)
+		self.set_icon_name('grive-utils')
+		self.set_border_width(10)
+		self.connect('delete-event', self.quit)
+		self.loop = asyncio.get_event_loop()
+		self.current_step = 0
+		self.token = asyncio.Queue(maxsize=1)
+
+		if not SUPPORTED:
+			dialog = Fatal(
+				self,
+				'Unsupported version',
+				'Your grive version is not supported.'
+				+ '\nPlease upgrade to grive 0.5.1+ to use grive-utils.')
+			dialog.run()
+			dialog.destroy()
+			sys.exit(1)
+
+		header = Gtk.HeaderBar()
+		header.set_title('grive-setup')
+		header.set_show_close_button(True)
+		header.set_has_subtitle(False)
+		self.set_titlebar(header)
+		self.next_button = Gtk.Button.new_with_label('Next')
+		self.next_button.connect('clicked', self.next_step)
+		header.pack_end(self.next_button)
+		self.prev_button = Gtk.Button.new_with_label('Back')
+		self.prev_button.connect('clicked', self.prev_step)
+		self.prev_button.set_sensitive(False)
+		header.pack_start(self.prev_button)
+		main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+		self.add(main_box)
+
+		self.choose_folder = Gtk.Revealer(
+			transition_type=Gtk.RevealerTransitionType.SLIDE_UP,
+			transition_duration=500)
+		main_box.pack_start(self.choose_folder, True, True, 0)
+		folder_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+		self.choose_folder.add(folder_box)
+		path_label = Gtk.Label('Choose folder to sync:')
+		folder_box.pack_start(path_label, True, True, 0)
+		self.path_chooser = Gtk.FileChooserButton.new(
+			'Google Drive folder', Gtk.FileChooserAction.SELECT_FOLDER)
+		self.path_chooser.set_current_folder(CONFIG['DEFAULT']['Path'])
+		folder_box.pack_start(self.path_chooser, True, True, 0)
+		self.choose_folder.set_reveal_child(True)
+
+		self.paste_token = Gtk.Revealer(
+			transition_type=Gtk.RevealerTransitionType.SLIDE_UP,
+			transition_duration=500)
+		main_box.pack_start(self.paste_token, True, True, 0)
+		paste_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+		self.paste_token.add(paste_box)
+		paste_label = Gtk.Label('Enter authentication code:')
+		paste_box.pack_start(paste_label, True, True, 0)
+		self.paste_entry = Gtk.Entry()
+		paste_box.pack_start(self.paste_entry, True, True, 0)
+
+		self.wait_setup = Gtk.Revealer(
+			transition_type=Gtk.RevealerTransitionType.SLIDE_UP,
+			transition_duration=500)
+		main_box.pack_start(self.wait_setup, True, True, 0)
+		wait_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+		self.wait_setup.add(wait_box)
+		spinner = Gtk.Spinner()
+		spinner.start()
+		wait_box.pack_start(spinner, True, True, 0)
+		wait_label = Gtk.Label('Setting up...')
+		wait_box.pack_start(wait_label, True, True, 0)
+
+		self.epilog = Gtk.Revealer(
+			transition_type=Gtk.RevealerTransitionType.SLIDE_UP,
+			transition_duration=500)
+		main_box.pack_start(self.epilog, True, True, 0)
+		final_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+		self.epilog.add(final_box)
+		select_button = Gtk.Button.new_with_label('Select files to sync')
+		select_button.connect('clicked', self.select_files)
+		final_box.pack_start(select_button, True, True, 0)
+		prefs_button = Gtk.Button.new_with_label('Preferences')
+		prefs_button.connect('clicked', self.show_prefs)
+		final_box.pack_start(prefs_button, True, True, 0)
+		launch_button = Gtk.Button.new_with_label('Launch grive-indicator')
+		launch_button.connect('clicked', self.launch_indicator)
+		final_box.pack_start(launch_button, True, True, 0)
+
+		self.show_all()
+		self.loop.run_forever()
+
+	def quit(self, window, event):
+
+		self.loop.stop()
+
+	def next_step(self, button):
+
+		self.current_step += 1
+		if self.current_step == 1:
+			path = self.path_chooser.get_filename()
+			CONFIG['DEFAULT']['init'] = 'true'
+			CONFIG['DEFAULT']['Path'] = path
+			save_config()
+			asyncio.ensure_future(self.run_setup())
+			self.choose_folder.set_reveal_child(False)
+			self.paste_token.set_reveal_child(True)
+			self.prev_button.set_sensitive(True)
+		elif self.current_step == 2:
+			token = self.paste_entry.get_text()
+			self.token.put_nowait(token)
+			self.paste_entry.set_text('')
+			self.paste_token.set_reveal_child(False)
+			self.next_button.set_sensitive(False)
+			self.wait_setup.set_reveal_child(True)
+
+	def prev_step(self, button):
+
+		self.current_step -= 1
+		if self.current_step == 0:
+			self.prev_button.set_sensitive(False)
+			self.grive.terminate()
+			self.paste_token.set_reveal_child(False)
+			self.choose_folder.set_reveal_child(True)
+		elif self.current_step == 1:
+			self.current_step = 0
+			self.prev_button.set_sensitive(False)
+			self.next_button.set_sensitive(True)
+			self.grive.terminate()
+			self.wait_setup.set_reveal_child(False)
+			self.choose_folder.set_reveal_child(True)
+		elif self.current_step == 2:
+			self.current_step = 0
+			self.epilog.set_reveal_child(False)
+			self.next_button.set_sensitive(True)
+			self.prev_button.set_sensitive(False)
+			self.choose_folder.set_reveal_child(True)
+
+	def select_files(self, button):
+
+		asyncio.ensure_future(self.select_files_async())
+
+	async def select_files_async(self):
+
+		await asyncio.create_subprocess_exec('./griveignore-editor')
+
+	def show_prefs(self, button):
+
+		dialog = Prefs(self)
+		dialog.run()
+		dialog.destroy()
+
+	def launch_indicator(self, button):
+
+		asyncio.ensure_future(self.launch_indicator_async())
+
+	async def launch_indicator_async(self):
+
+		await asyncio.create_subprocess_exec('./grive-indicator')
+
+	async def run_setup(self):
+
+		self.grive = await asyncio.create_subprocess_exec(
+			'grive', '--dry-run', '--auth', '--path', CONFIG['DEFAULT']['Path'],
+			stdin=PIPE,
+			stdout=PIPE,
+			stderr=STDOUT)
+		while True:
+			line = (await self.grive.stdout.readline()).decode()
+			if line.startswith('https://accounts.google.com/'):
+				webbrowser.open(line)
+			elif line.startswith('Please input the authentication code here:'):
+				token = await self.token.get()
+				self.grive.stdin.write((token + '\n').encode())
+				self.token.task_done()
+			elif self.grive.stdout.at_eof():
+				break
+		exit_code = await self.grive.wait()
+		if exit_code:
+			self.current_step = 0
+			self.wait_setup.set_reveal_child(False)
+			self.choose_folder.set_reveal_child(True)
+			dialog = Fatal(
+				self,
+				'grive error',
+				'grive exited with code {}.\nTry again.'.format(exit_code))
+			dialog.run()
+			dialog.destroy()
+		else:
+			self.current_step += 1
+			self.wait_setup.set_reveal_child(False)
+			self.next_button.set_sensitive(False)
+			self.epilog.set_reveal_child(True)
+
+
+if __name__ == '__main__':
+	gbulb.install()
+	Setup()

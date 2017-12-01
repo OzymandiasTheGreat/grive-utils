@@ -1,0 +1,379 @@
+#!/usr/bin/env python3
+
+import asyncio
+from asyncio.subprocess import PIPE, DEVNULL
+from pathlib import PurePath, Path
+from itertools import cycle
+import gi
+gi.require_version('Gtk', '3.0')
+from gi.repository import Gtk, Gio
+import gbulb
+try:
+	from grive_utils.common import *
+	from grive_utils.dialog import *
+except ImportError:
+	from package.common import *
+	from package.dialog import *
+
+
+class FileChooser(Gtk.Window):
+
+	def __init__(self):
+
+		self.loop = asyncio.get_event_loop()
+
+		Gtk.Window.__init__(self)
+		self.set_icon_name('grive-utils')
+		self.set_title('Select files to sync')
+		self.set_border_width(10)
+		self.connect('delete-event', self.quit)
+
+		self.griveignore = Path(CONFIG['DEFAULT']['Path']) / '.griveignore'
+		try:
+			with self.griveignore.open() as fd:
+				self.patterns = fd.read().split('\n')
+			self.patterns = [pattern for pattern in self.patterns if pattern]
+		except FileNotFoundError:
+			self.patterns = []
+
+		box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+		self.add(box)
+
+		self.build_indicator(box)
+		self.build_tree(box)
+		self.add_buttons(box)
+		asyncio.ensure_future(self.indicate())
+		asyncio.ensure_future(self.load())
+
+		self.show_all()
+		self.loop.run_forever()
+
+	def build_indicator(self, box):
+
+		self.hider = Gtk.Revealer(
+			transition_type=Gtk.RevealerTransitionType.SLIDE_DOWN,
+			reveal_child=True)
+		box.pack_start(self.hider, False, False, 0)
+		hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+		self.hider.add(hbox)
+		self.spinner = Gtk.Spinner()
+		hbox.pack_start(self.spinner, False, False, 0)
+		self.indicator = Gtk.Label('Loading')
+		hbox.pack_start(self.indicator, False, False, 0)
+
+	async def indicate(self):
+
+		states = ('Loading.', 'Loading..', 'Loading...', 'Loading')
+		loop = cycle(states)
+		self.spinner.start()
+		while not len(self.tree):
+			self.indicator.set_text(next(loop))
+			await asyncio.sleep(0.3)
+		self.hider.set_reveal_child(False)
+		self.spinner.stop()
+
+	def build_tree(self, box):
+
+		# sync, inconsistent, icon name, file name, file path, is file
+		self.tree = Gtk.TreeStore(bool, bool, str, str, str, bool)
+		view = Gtk.TreeView.new_with_model(self.tree)
+		view.get_selection().set_mode(Gtk.SelectionMode.NONE)
+		scrolled = Gtk.ScrolledWindow()
+		scrolled.set_min_content_height(450)
+		scrolled.set_min_content_width(550)
+		scrolled.add(view)
+		box.pack_start(scrolled, True, True, 0)
+		render_check = Gtk.CellRendererToggle()
+		render_check.connect('toggled', self.on_toggle)
+		check_column = Gtk.TreeViewColumn(
+			'', render_check, active=0, inconsistent=1)
+		self.check_button = Gtk.CheckButton.new_with_label('All')
+		self.check_button.set_active(True)
+		self.check_button.show()
+		check_column.set_widget(self.check_button)
+		check_column.set_clickable(True)
+		check_column.connect('clicked', self.check_all)
+		view.append_column(check_column)
+		render_icon = Gtk.CellRendererPixbuf()
+		icon_column = Gtk.TreeViewColumn('', render_icon, icon_name=2)
+		icon_column.set_sort_column_id(5)
+		view.append_column(icon_column)
+		render_text = Gtk.CellRendererText()
+		text_column = Gtk.TreeViewColumn('Name', render_text, text=3)
+		text_column.set_sort_column_id(3)
+		view.append_column(text_column)
+		text_column.clicked()
+		icon_column.clicked()
+
+	def check_all(self, column):
+
+		def set_state(model, path, iter_, data):
+
+			model[path][0] = data
+
+		state = not self.check_button.get_active()
+		self.check_button.set_active(state)
+		self.tree.foreach(set_state, state)
+
+	def on_toggle(self, render_check, path):
+
+		state = not render_check.get_active()
+		self.tree[path][0] = state
+		self.tree[path][1] = False
+		tree_iter = self.tree.get_iter(path)
+		if self.tree.iter_has_child(tree_iter):
+			self.toggle_children(state, tree_iter)
+		parent_iter = self.tree.iter_parent(tree_iter)
+		if parent_iter:
+			self.toggle_parents(state, parent_iter)
+
+	def toggle_children(self, state, tree_iter):
+
+		child_iter = self.tree.iter_children(tree_iter)
+		for i in range(self.tree.iter_n_children(tree_iter)):
+			self.tree[child_iter][0] = state
+			if self.tree.iter_has_child(child_iter):
+				self.toggle_children(state, child_iter)
+			child_iter = self.tree.iter_next(child_iter)
+
+	def toggle_parents(self, state, tree_iter):
+
+		if state and self.check_children(tree_iter):
+			self.tree[tree_iter][0] = True
+			self.tree[tree_iter][1] = False
+		else:
+			self.tree[tree_iter][0] = False
+			self.tree[tree_iter][1] = True
+		parent_iter = self.tree.iter_parent(tree_iter)
+		if parent_iter:
+			self.toggle_parents(state, parent_iter)
+
+	def check_children(self, tree_iter):
+
+		states = []
+		child_iter = self.tree.iter_children(tree_iter)
+		for i in range(self.tree.iter_n_children(tree_iter)):
+			state = self.tree[child_iter][0]
+			states.append(state)
+			if self.tree.iter_has_child(child_iter):
+				states.append(self.check_children(child_iter))
+			child_iter = self.tree.iter_next(child_iter)
+		return all(states)
+
+	def add_buttons(self, box):
+
+		buttonbox = Gtk.ButtonBox(
+			orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+		buttonbox.set_layout(Gtk.ButtonBoxStyle.END)
+		box.pack_start(buttonbox, False, False, 0)
+		apply = Gtk.Button.new_with_label('Apply')
+		apply.connect('clicked', lambda button: self.apply())
+		buttonbox.pack_start(apply, True, True, 0)
+		cancel = Gtk.Button.new_with_label('Cancel')
+		cancel.connect('clicked', lambda button: self.quit(self, None))
+		buttonbox.pack_start(cancel, True, True, 0)
+		ok = Gtk.Button.new_with_label('OK')
+		ok.connect('clicked', self.on_ok)
+		buttonbox.pack_start(ok, True, True, 0)
+
+	async def load(self):
+
+		try:
+			self.griveignore.unlink()
+		except FileNotFoundError:
+			pass
+		grive = await asyncio.create_subprocess_exec(
+			'grive', '--dry-run', '--verbose',
+			'--path', CONFIG['DEFAULT']['Path'],
+			stdout=DEVNULL,
+			stderr=PIPE)
+		folders = {'.': None}
+		while True:
+			line = (await grive.stderr.readline()).decode()
+			if 'google document' not in line and 'multiple parents' not in line:
+				match = FILENAME.match(line)
+				# sync, inconsistent, icon name, file name, file path, is file
+				if match and match.group('path'):
+					path = PurePath(match.group('path')).relative_to(
+						CONFIG['DEFAULT']['Path'])
+					mime = Gio.content_type_guess(str(path), None)[0]
+					gicon = Gio.content_type_get_icon(mime)
+					icon = ('folder' if match.group('type') == 'folder'
+						else gicon.get_names()[0])
+					ignore, include = self.glob(path)
+					tree_iter = folders[str(path.parent)]
+					if icon == 'folder':
+						folders[str(path)] = self.tree.append(
+							tree_iter,
+							[not ignore or include,
+								False,
+								icon,
+								path.name,
+								str(path),
+								False])
+					else:
+						sync = not ignore or include
+						self.tree.append(
+							tree_iter,
+							[sync,
+								False,
+								icon,
+								path.name,
+								str(path),
+								True])
+						if not sync:
+							while True:
+								if tree_iter is None:
+									break
+								self.tree[tree_iter][0] = False
+								self.tree[tree_iter][1] = True
+								parent_path = str(
+									PurePath(self.tree[tree_iter][4]).parent)
+								tree_iter = folders[parent_path]
+			if "doesn't exist in server, uploading" in line:
+				match = FILENAME.match(line)
+				if match:
+					path = Path(match.group('local')).relative_to(
+						CONFIG['DEFAULT']['Path'])
+					folder = path.is_dir()
+					if folder:
+						mime = Gio.content_type_guess(str(path), None)[0]
+						gicon = Gio.content_type_get_icon(mime)
+					icon = 'folder' if folder else gicon.get_names()[0]
+					ignore, include = self.glob(path)
+					tree_iter = folders[str(path.parent)]
+					if folder:
+						folders[str(path)] = self.tree.append(
+							tree_iter,
+							[not ignore or include,
+								False,
+								icon,
+								path.name,
+								str(path),
+								False])
+					else:
+						sync = not ignore or include
+						self.tree.append(
+							tree_iter,
+							[sync,
+								False,
+								icon,
+								path.name,
+								str(path),
+								True])
+						if not sync:
+							while True:
+								if tree_iter is None:
+									break
+								self.tree[tree_iter][0] = False
+								self.tree[tree_iter][1] = True
+								parent_path = str(
+									PurePath(self.tree[tree_iter][4]).parent)
+								tree_iter = folders[parent_path]
+			if grive.stderr.at_eof():
+				break
+		exit_code = await grive.wait()
+		if exit_code:
+			dialog = Fatal(
+				self, 'Grive Error',
+				'Could not get file list\nGrive exited with code {0}'.format(
+					exit_code))
+			dialog.run()
+			dialog.destroy()
+			self.quit(self, None)
+
+	def glob(self, path):
+
+		ignores = []
+		includes = []
+		for pattern in self.patterns:
+			if pattern.startswith('!'):
+				includes.append(path.match(pattern[1:]))
+				includes.append(str(path).startswith(pattern[1:].strip('*')))
+			else:
+				ignores.append(path.match(pattern))
+				ignores.append(str(path).startswith(pattern.strip('*')))
+		return any(ignores), any(includes)
+
+	def quit(self, window, event):
+
+		self.write()
+		self.loop.stop()
+
+	def write(self):
+
+		with self.griveignore.open('w') as fd:
+			fd.write('\n'.join(self.patterns))
+		#~ print('\n'.join(self.patterns))
+
+	def apply(self):
+
+		self.patterns = self.generate_patterns()
+		self.write()
+
+	def on_ok(self, button):
+
+		self.patterns = self.generate_patterns()
+		self.quit(self, None)
+
+	def generate_patterns(self):
+
+		patterns = {'.griveignore'}
+		child_iter = self.tree.iter_children(None)
+		for i in range(self.tree.iter_n_children(None)):
+			sync = self.tree[child_iter][0]
+			if not sync:
+				if self.tree[child_iter][2] != 'folder':
+					path = self.tree[child_iter][4]
+					patterns.add(path)
+				else:
+					partial = self.tree[child_iter][1]
+					if not partial:
+						path = self.tree[child_iter][4]
+						patterns.add(path + '/**')
+					else:
+						self.walk(child_iter, patterns)
+			child_iter = self.tree.iter_next(child_iter)
+		return patterns
+
+	def walk(self, tree_iter, patterns, includes_only=False):
+
+		ignore = []
+		include = []
+		child_iter = self.tree.iter_children(tree_iter)
+		for i in range(self.tree.iter_n_children(tree_iter)):
+			sync = self.tree[child_iter][0]
+			partial = self.tree[child_iter][1]
+			if sync:
+				include.append((child_iter, partial))
+			else:
+				ignore.append((child_iter, partial))
+			child_iter = self.tree.iter_next(child_iter)
+		if len(ignore) >= len(include):
+			for child_iter, partial in include:
+				path = self.tree[child_iter][4]
+				if self.tree[child_iter][2] != 'folder':
+					patterns.add('!' + path)
+				else:
+					patterns.add('!' + path + '/**')
+			for child_iter, partial in ignore:
+				if partial:
+					self.walk(child_iter, patterns, True)
+			if not includes_only:
+				path = self.tree[tree_iter][4]
+				patterns.add(path + '/**')
+		else:
+			for child_iter, partial in ignore:
+				path = self.tree[child_iter][4]
+				if self.tree[child_iter][2] != 'folder':
+					patterns.add(path)
+				else:
+					if partial:
+						self.walk(child_iter, patterns)
+					else:
+						patterns.add(path + '/**')
+
+
+if __name__ == '__main__':
+	gbulb.install()
+	FileChooser()
